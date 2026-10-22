@@ -14,6 +14,7 @@ error accumulates across layers, while hidden_states is returned as a
 pre-quantized QuantizedActivation for the immediate consumer GEMM.
 """
 
+import os
 from collections.abc import Callable
 from typing import Any, overload
 
@@ -38,6 +39,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import direct_register_custom_op
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
@@ -219,6 +221,30 @@ def _rms_norm_fp8_dynamic_block_supported(
     return _supported
 
 
+def _exp_fi_fused_add_rmsnorm_fp8_block_quant(
+    out: torch.Tensor,
+    block_scale: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> None:
+    # LOCAL-ONLY experiment: flashinfer's register_custom_op is a no-op, so wrap
+    # the call in a real op to keep it opaque to Dynamo.
+    import flashinfer.norm
+
+    flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+        out, block_scale, torch.empty_like(input), input, residual, weight, eps
+    )
+
+
+direct_register_custom_op(
+    "exp_fi_fused_add_rmsnorm_fp8_block_quant",
+    _exp_fi_fused_add_rmsnorm_fp8_block_quant,
+    mutates_args=["out", "block_scale", "residual"],
+)
+
+
 def _rms_norm_fp8_dynamic_block(
     norm_fn: RMSNorm,
     x: torch.Tensor,
@@ -234,6 +260,32 @@ def _rms_norm_fp8_dynamic_block(
     tma_aligned_m = round_up(num_tokens, 4)
 
     result = torch.empty(x.shape, dtype=FP8_DTYPE, device=x.device)
+    # LOCAL-ONLY experiment (D_fi): FlashInfer single-pass producer, same layout.
+    if (
+        os.environ.get("VLLM_EXPERIMENT_FI_NORM_PRODUCER") == "1"
+        and residual is not None
+        and x.ndim == 2
+        and group_size == 128
+    ):
+        block_scale = torch.empty(
+            (num_groups, tma_aligned_m), dtype=torch.float32, device=x.device
+        )
+        torch.ops.vllm.exp_fi_fused_add_rmsnorm_fp8_block_quant(
+            result,
+            block_scale,
+            x,
+            residual,
+            norm_fn.weight.data,
+            norm_fn.variance_epsilon,
+        )
+        qa = QuantizedActivation(
+            data=result,
+            scale=block_scale.t()[:num_tokens],
+            orig_dtype=x.dtype,
+            orig_shape=x.shape,
+            quant_key=quant_key,
+        )
+        return qa, residual
     # Column-major, TMA-aligned (16-byte / 4-float) scale layout required by
     # sm90 block-scaled FP8 GEMM consumers (FlashInfer swapAB and DeepGEMM).
     scales = torch.empty_strided(
