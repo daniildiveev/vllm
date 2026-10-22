@@ -38,6 +38,7 @@ from vllm.model_executor.layers.attention.encoder_only_attention import (
     Attention,
     EncoderOnlyAttention,
 )
+from vllm.model_executor.layers.fusion.fused_norm_quant import maybe_fused_norm_quant
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -237,16 +238,28 @@ class Qwen3DecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = maybe_fused_norm_quant(
+                self.input_layernorm, hidden_states, self.self_attn.qkv_proj
+            )
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = maybe_fused_norm_quant(
+                self.input_layernorm,
+                hidden_states,
+                self.self_attn.qkv_proj,
+                residual=residual,
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = maybe_fused_norm_quant(
+            self.post_attention_layernorm,
+            hidden_states,
+            self.mlp.gate_up_proj,
+            residual=residual,
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
