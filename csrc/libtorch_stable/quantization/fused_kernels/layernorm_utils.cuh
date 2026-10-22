@@ -671,7 +671,7 @@ __device__ void rms_norm_per_block_quant_single_pass(
               VLLM_SHFL_XOR_SYNC_WIDTH(group_absmax, mask, THREADS_PER_GROUP));
   }
 
-  constexpr float qmax = quant_type_max_v<scalar_out_t>;
+  constexpr scalar_out_t qmax{quant_type_max_v<scalar_out_t>};
   float group_scale = scale_ub ? fminf(group_absmax, *scale_ub) : group_absmax;
   group_scale =
       fmaxf(group_scale / qmax, min_scaling_factor<scalar_out_t>::val());
